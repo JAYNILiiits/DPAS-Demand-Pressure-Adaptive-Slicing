@@ -1,511 +1,369 @@
-"""
-DPAS (Demand-Pressure-based Adaptive Slicing) Algorithm Implementation
-=======================================================================
-
-Author: Network Slicing Research Group
-Date: 2026
-Purpose: Real-world validation on Telecom Italia cellular traffic traces
-
-This script:
-1. Loads Telecom Italia dataset (CSV format)
-2. Preprocesses traffic into three slices (eMBB, URLLC, mMTC)
-3. Runs DPAS algorithm
-4. Compares against baselines (Static, Proportional, Fair-Share)
-5. Generates performance metrics and plots
-6. Outputs results ready for LaTeX inclusion
-"""
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
-from datetime import datetime, timedelta
+from pathlib import Path
+import gc
+from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
-# ============================================================================
-# CONFIG: ADJUST BASED ON YOUR DATA PATH
-# ============================================================================
+# =====================================================
+# CONFIGURATION
+# =====================================================
+CONFIG = {
+    'chunk_size': 10000,           # Process data in chunks
+    'C': 100.0,                    # Total bandwidth (Mbps)
+    'alpha': 0.4,                  # DPAS learning rate
+    'min_bandwidth': 5,            # Minimum slice bandwidth
+    'max_bandwidth': 80,           # Maximum slice bandwidth
+    'sla_thresholds': [100, 10, 500],  # ms for eMBB, URLLC, mMTC
+    'required_cols': ['datetime', 'smsin', 'smsout', 'callin', 'callout', 'internet']
+}
 
-DATA_PATH = "telecom_italia_2013.csv"  # Replace with actual dataset path
-OUTPUT_DIR = "./results/"  # Directory to save plots and results
-RESULTS_FILE = "experimental_results.txt"  # For LaTeX copy-paste
-
-# ============================================================================
-# PART 1: DATA LOADING AND PREPROCESSING
-# ============================================================================
-
-def load_telecom_italia_data(filepath):
-    """
-    Load Telecom Italia dataset.
-    Expected columns: datetime, countrycode, cosmsln (SMS out), smsln (SMS in),
-                      callin, callout, internet
-    """
-    print("[1] Loading Telecom Italia dataset...")
+# =====================================================
+# OPTIMIZED DATA LOADING
+# =====================================================
+def load_excel_optimized(filepath, chunk_size=None):
+    """Load Excel with memory optimization"""
     try:
-        df = pd.read_csv(filepath)
-        print(f"    ✓ Loaded {len(df)} records")
-        print(f"    Columns: {list(df.columns)}")
+        # Read with specific dtypes to reduce memory
+        dtype_dict = {
+            'smsin': 'float32',
+            'smsout': 'float32',
+            'callin': 'float32',
+            'callout': 'float32',
+            'internet': 'float32'
+        }
+
+        if chunk_size:
+            # For very large files, use chunked reading
+            chunks = []
+            for chunk in pd.read_excel(filepath, chunksize=chunk_size, dtype=dtype_dict):
+                chunks.append(chunk)
+            df = pd.concat(chunks, ignore_index=True)
+            del chunks
+            gc.collect()
+        else:
+            df = pd.read_excel(filepath, dtype=dtype_dict)
+
         return df
-    except FileNotFoundError:
-        print(f"    ✗ File not found: {filepath}")
-        print("    Creating synthetic Telecom Italia-like dataset for demo...")
-        return generate_synthetic_data()
+    except Exception as e:
+        print(f"Error loading {filepath}: {e}")
+        return None
 
-def generate_synthetic_data(n_records=1000):
-    """
-    Generate synthetic Telecom Italia-like data for testing.
-    Mimics realistic cellular traffic patterns.
-    """
-    np.random.seed(42)
-    dates = pd.date_range('2013-11-01', periods=n_records, freq='H')
-    
-    # Realistic traffic patterns (circadian + random burstiness)
-    hours = dates.hour
-    
-    # SMS: Peaks in evening (20-23)
-    sms_base = 100 * (1 + 0.5 * np.sin(2 * np.pi * hours / 24 - np.pi/2))
-    sms_in = sms_base + np.random.normal(0, 10, n_records)
-    sms_out = sms_base + np.random.normal(0, 10, n_records)
-    
-    # Calls: Peaks during day (10-14, 19-21)
-    call_base = 150 * (1 + 0.8 * np.sin(2 * np.pi * (hours + 2) / 24))
-    callin = call_base + np.random.normal(0, 15, n_records)
-    callout = call_base + np.random.normal(0, 15, n_records)
-    
-    # Internet: Peaks in evening (19-23), low during night
-    internet_base = 500 * (1 + np.sin(2 * np.pi * (hours + 4) / 24))
-    internet = np.maximum(internet_base + np.random.normal(0, 50, n_records), 0)
-    
-    data = pd.DataFrame({
-        'datetime': dates,
-        'smsln': np.maximum(sms_in, 1),
-        'cosmsln': np.maximum(sms_out, 1),
-        'callin': np.maximum(callin, 1),
-        'callout': np.maximum(callout, 1),
-        'internet': np.maximum(internet, 1)
-    })
-    
-    print(f"    ✓ Generated synthetic data: {len(data)} records")
-    return data
+# =====================================================
+# DATA CLEANING PIPELINE
+# =====================================================
+def clean_dataframe(df):
+    """Clean and prepare dataframe efficiently"""
+    # Remove empty columns
+    df = df.dropna(axis=1, how='all')
 
-def preprocess_traffic(df, slice_distribution=None):
-    """
-    Convert raw traffic (SMS, calls, internet) to bandwidth demand for slices.
-    
-    Slice distribution:
-    - eMBB (Internet): High data, ~60% of total capacity
-    - URLLC (Calls): Moderate, low-latency, ~30%
-    - mMTC (SMS): Low data, ~10%
-    """
-    if slice_distribution is None:
-        slice_distribution = {'eMBB': 0.60, 'URLLC': 0.30, 'mMTC': 0.10}
-    
-    print("[2] Preprocessing traffic into slices...")
-    
-    # Normalize traffic to Mbps equivalents
-    # SMS: ~160 bytes per SMS = 1.28 Kbps per SMS
-    # Call: 64 Kbps per active call
-    # Internet: 1 Mbps per unit (already in Mbps)
-    
-    sms_rate = 0.001  # Mbps per SMS/hour
-    call_rate = 0.064  # Mbps per call-minute/hour
-    
-    df['SMS'] = (df['smsln'] + df['cosmsln']) * sms_rate  # Mbps
-    df['Calls'] = (df['callin'] + df['callout']) * call_rate  # Mbps
-    df['Internet'] = df['internet']  # Already in Mbps
-    
-    # Total demand
-    df['Total_Demand'] = df['SMS'] + df['Calls'] + df['Internet']
-    
-    # Slice-specific demands
-    df['D_eMBB'] = df['Internet']  # Internet ← eMBB
-    df['D_URLLC'] = df['Calls']    # Calls ← URLLC
-    df['D_mMTC'] = df['SMS']       # SMS ← mMTC
-    
-    print(f"    ✓ Sliced traffic into 3 categories")
-    print(f"    - eMBB (Internet): {df['D_eMBB'].mean():.2f} Mbps avg")
-    print(f"    - URLLC (Calls): {df['D_URLLC'].mean():.2f} Mbps avg")
-    print(f"    - mMTC (SMS): {df['D_mMTC'].mean():.2f} Mbps avg")
-    print(f"    - Total: {df['Total_Demand'].mean():.2f} Mbps avg")
-    
+    # Normalize column names
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # Check required columns
+    missing = [c for c in CONFIG['required_cols'] if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+
+    # Keep only needed columns
+    df = df[CONFIG['required_cols']].copy()
+
+    # Convert to numeric efficiently
+    for col in CONFIG['required_cols'][1:]:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Fill NaN with 0
+    df.fillna(0, inplace=True)
+
+    # Convert to float32 to save memory
+    for col in df.columns[1:]:
+        df[col] = df[col].astype('float32')
+
     return df
 
-# ============================================================================
-# PART 2: ALGORITHM IMPLEMENTATIONS
-# ============================================================================
+# =====================================================
+# FEATURE ENGINEERING (VECTORIZED)
+# =====================================================
+def engineer_features(df):
+    """Vectorized feature creation"""
+    df['rt'] = df['callin'] + df['callout']
+    df['sig'] = df['smsin'] + df['smsout']
+    df['data'] = df['internet']
+    df['total'] = df['rt'] + df['sig'] + df['data']
 
-class DPASAlgorithm:
-    """
-    Demand-Pressure-based Adaptive Slicing (DPAS) Algorithm
-    """
-    
-    def __init__(self, num_slices, total_capacity, control_gain=0.5, min_alloc=None, max_alloc=None):
-        self.N = num_slices
-        self.C = total_capacity
-        self.alpha = control_gain  # Control gain
-        
-        # Default bounds (Mbps)
-        if min_alloc is None:
-            min_alloc = [10, 10, 5]  # eMBB, URLLC, mMTC
-        if max_alloc is None:
-            max_alloc = [60, 40, 10]
-        
-        self.B_min = min_alloc
-        self.B_max = max_alloc
-        
-        # Initialize allocation uniformly
-        self.B = np.array([self.C / self.N] * self.N, dtype=float)
-        
-        # History for analysis
-        self.history = {
-            'B': [self.B.copy()],
-            'P': [],
-            'delay': []
-        }
-    
-    def compute_pressure(self, demand):
-        """
-        Compute demand pressure for each slice.
-        P_i = D_i / B_i
-        """
-        pressure = demand / np.maximum(self.B, 1e-6)  # Avoid division by zero
-        return pressure
-    
-    def step(self, demand):
-        """
-        Execute one control step of DPAS.
-        
-        Args:
-            demand: numpy array of demands for each slice [D_1, D_2, ..., D_N]
-        
-        Returns:
-            Updated bandwidth allocation B
-        """
-        # Step 1: Compute pressure for each slice
-        P = self.compute_pressure(demand)
-        P_mean = np.mean(P)
-        
-        # Step 2: Compute pressure deviation
-        delta_P = P - P_mean
-        
-        # Step 3: Update bandwidth proportional to pressure deviation
-        # High pressure slices get more bandwidth, low pressure get less
-        delta_B = -self.alpha * delta_P * self.B
-        B_new = self.B + delta_B
-        
-        # Step 4: Apply bounds
-        B_new = np.clip(B_new, self.B_min, self.B_max)
-        
-        # Step 5: Normalize to capacity constraint
-        if np.sum(B_new) > 0:
-            scale = self.C / np.sum(B_new)
-            B_new = B_new * scale
-        
-        # Update allocation
-        self.B = B_new
-        
-        # Record history
-        self.history['B'].append(self.B.copy())
-        self.history['P'].append(P.copy())
-        
-        # Compute delay (M/M/1 approximation)
-        delay = demand / np.maximum(self.B - demand, 1e-6)
-        delay = np.clip(delay, 0, 1000)  # Cap unrealistic values
-        self.history['delay'].append(delay.copy())
-        
-        return self.B.copy()
+    # Remove zero traffic rows
+    df = df[df['total'] > 0].copy()
 
-class StaticSlicing:
-    """
-    Baseline: Fixed proportional allocation (no adaptation)
-    """
-    def __init__(self, num_slices, total_capacity):
-        self.N = num_slices
-        self.C = total_capacity
-        self.B = None
-        self.history = {'B': [], 'P': [], 'delay': []}
-    
-    def step(self, demand):
-        if self.B is None:
-            # Set allocation based on initial demand
-            self.B = self.C * (demand / np.sum(demand))
-        
-        self.history['B'].append(self.B.copy())
-        
-        P = demand / np.maximum(self.B, 1e-6)
-        self.history['P'].append(P.copy())
-        
-        delay = demand / np.maximum(self.B - demand, 1e-6)
-        delay = np.clip(delay, 0, 1000)
-        self.history['delay'].append(delay.copy())
-        
-        return self.B.copy()
+    # Calculate ratios (vectorized)
+    df['rt_ratio'] = df['rt'] / df['total']
+    df['sig_ratio'] = df['sig'] / df['total']
+    df['data_ratio'] = df['data'] / df['total']
 
-class ProportionalSlicing:
-    """
-    Baseline: Naive demand-proportional allocation (reactive but unaware of SLA)
-    """
-    def __init__(self, num_slices, total_capacity):
-        self.N = num_slices
-        self.C = total_capacity
-        self.history = {'B': [], 'P': [], 'delay': []}
-    
-    def step(self, demand):
-        # Allocate proportional to demand at each time step
-        B = self.C * (demand / np.maximum(np.sum(demand), 1e-6))
-        
-        self.history['B'].append(B.copy())
-        
-        P = demand / np.maximum(B, 1e-6)
-        self.history['P'].append(P.copy())
-        
-        delay = demand / np.maximum(B - demand, 1e-6)
-        delay = np.clip(delay, 0, 1000)
-        self.history['delay'].append(delay.copy())
-        
-        return B
+    return df
 
-class FairShareSlicing:
-    """
-    Baseline: Equal allocation to all slices (max fairness, ignores demand)
-    """
-    def __init__(self, num_slices, total_capacity):
-        self.N = num_slices
-        self.C = total_capacity
-        self.B = np.array([self.C / self.N] * self.N)
-        self.history = {'B': [], 'P': [], 'delay': []}
-    
-    def step(self, demand):
-        self.history['B'].append(self.B.copy())
-        
-        P = demand / np.maximum(self.B, 1e-6)
-        self.history['P'].append(P.copy())
-        
-        delay = demand / np.maximum(self.B - demand, 1e-6)
-        delay = np.clip(delay, 0, 1000)
-        self.history['delay'].append(delay.copy())
-        
-        return self.B.copy()
+# =====================================================
+# TRAFFIC CLASSIFICATION (VECTORIZED)
+# =====================================================
+def classify_traffic_vectorized(df):
+    """Vectorized traffic classification"""
+    conditions = [
+        df['data_ratio'] >= 0.6,
+        df['rt_ratio'] >= 0.3,
+        df['sig_ratio'] >= 0.2
+    ]
+    choices = ['eMBB', 'URLLC', 'mMTC']
+    df['Traffic_Class'] = np.select(conditions, choices, default='Mixed')
+    return df
 
-# ============================================================================
-# PART 3: SIMULATION AND EVALUATION
-# ============================================================================
-
-def run_simulation(demands, algorithms, sla_thresholds):
+# =====================================================
+# DPAS ALGORITHM (OPTIMIZED)
+# =====================================================
+def dpas_slicing(demands, C=100.0, alpha=0.4, min_bw=5, max_bw=80):
     """
-    Run all algorithms on the same demand trace and collect metrics.
-    
+    Optimized DPAS with NumPy vectorization
+
     Args:
-        demands: T x N array of demands over time
-        algorithms: dict of {name: algorithm_object}
-        sla_thresholds: delay limits for each slice [delay_max_1, delay_max_2, ...]
-    
+        demands: (N, 3) array of [data, rt, sig] demands
+        C: Total bandwidth
+        alpha: Learning rate
+        min_bw, max_bw: Bandwidth constraints
+
     Returns:
-        results: dict with metrics for each algorithm
+        B_hist: (N, 3) array of bandwidth allocations
     """
-    results = {}
-    T = len(demands)
-    
-    for algo_name, algo in algorithms.items():
-        print(f"    Running {algo_name}...")
-        
-        for t in range(T):
-            algo.step(demands[t])
-        
-        # Compute metrics
-        B_array = np.array(algo.history['B'])  # T x N
-        P_array = np.array(algo.history['P'])  # T x N
-        delay_array = np.array(algo.history['delay'])  # T x N
-        
-        # SLA satisfaction rate
-        sla_violations = np.zeros_like(delay_array)
-        for i, threshold in enumerate(sla_thresholds):
-            sla_violations[:, i] = delay_array[:, i] > threshold
-        
-        sla_sat_rate = 100 * (1 - np.mean(sla_violations))
-        
-        # Average delay
-        avg_delay = np.mean(delay_array)
-        
-        # Oscillation (std of bandwidth changes)
-        oscillation = np.std(np.diff(B_array, axis=0))
-        
-        # Fairness (Jain's index)
-        fairness_scores = []
-        for t in range(T):
-            B_t = B_array[t]
-            fairness = (np.sum(B_t) ** 2) / (len(B_t) * np.sum(B_t ** 2))
-            fairness_scores.append(fairness)
-        fairness = np.mean(fairness_scores)
-        
-        results[algo_name] = {
-            'sla_sat_rate': sla_sat_rate,
-            'avg_delay': avg_delay,
-            'oscillation': oscillation,
-            'fairness': fairness,
-            'B_array': B_array,
-            'P_array': P_array,
-            'delay_array': delay_array
-        }
-    
-    return results
+    N = len(demands)
+    B_hist = np.zeros((N, 3), dtype=np.float32)
+    B = np.array([C/3, C/3, C/3], dtype=np.float32)
 
-# ============================================================================
-# PART 4: MAIN EXECUTION
-# ============================================================================
+    for i in range(N):
+        D = demands[i]
+        pressure = D / np.maximum(B, 1e-6)
+        delta = pressure - pressure.mean()
+        B = B - alpha * delta * B
+        B = np.clip(B, min_bw, max_bw)
+        B = B * (C / B.sum())
+        B_hist[i] = B
 
-def main():
-    import os
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    print("\n" + "="*70)
-    print("DPAS Algorithm: Real-World Validation on Telecom Italia Data")
-    print("="*70 + "\n")
-    
-    # ---- Step 1: Load Data ----
-    df = load_telecom_italia_data(DATA_PATH)
-    
-    # ---- Step 2: Preprocess ----
-    df = preprocess_traffic(df)
-    
-    # ---- Step 3: Prepare Demand Array ----
-    print("\n[3] Preparing demand traces...")
-    slice_names = ['eMBB', 'URLLC', 'mMTC']
-    demand_cols = ['D_eMBB', 'D_URLLC', 'D_mMTC']
-    demands = df[demand_cols].values  # T x 3
-    T = len(demands)
-    print(f"    ✓ {T} time steps, {len(slice_names)} slices")
-    
-    # Total system capacity
-    C = 100  # Mbps (typical cell)
-    sla_thresholds = np.array([100, 10, 500])  # ms (eMBB, URLLC, mMTC)
-    
-    # ---- Step 4: Initialize Algorithms ----
-    print("\n[4] Initializing algorithms...")
-    algorithms = {
-        'DPAS': DPASAlgorithm(3, C, control_gain=0.5),
-        'Static': StaticSlicing(3, C),
-        'Proportional': ProportionalSlicing(3, C),
-        'Fair-Share': FairShareSlicing(3, C)
-    }
-    print(f"    ✓ 4 algorithms ready")
-    
-    # ---- Step 5: Run Simulation ----
-    print("\n[5] Running simulation...")
-    results = run_simulation(demands, algorithms, sla_thresholds)
-    
-    # ---- Step 6: Report Results ----
-    print("\n[6] RESULTS SUMMARY:")
-    print("-" * 70)
-    print(f"{'Algorithm':<20} {'SLA Sat (%)':<15} {'Avg Delay (ms)':<18} {'Oscillation':<15}")
-    print("-" * 70)
-    
-    results_text = []
-    for algo_name, metrics in results.items():
-        print(f"{algo_name:<20} {metrics['sla_sat_rate']:<15.2f} "
-              f"{metrics['avg_delay']:<18.2f} {metrics['oscillation']:<15.4f}")
-        results_text.append(f"{algo_name}: {metrics['sla_sat_rate']:.1f}%")
-    
-    print("-" * 70)
-    
-    # ---- Step 7: Visualizations ----
-    print("\n[7] Generating visualizations...")
-    
-    # Plot 1: Bandwidth allocation over time (eMBB slice)
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
-    
-    for slice_idx, slice_name in enumerate(slice_names):
-        for algo_name, metrics in results.items():
-            B = metrics['B_array'][:, slice_idx]
-            D = demands[:, slice_idx]
-            axes[slice_idx].plot(B, label=algo_name, linewidth=1.5, alpha=0.8)
-        
-        axes[slice_idx].plot(demands[:, slice_idx], 'k--', label='Demand', linewidth=2, alpha=0.5)
-        axes[slice_idx].set_ylabel(f'{slice_name} Bandwidth (Mbps)')
-        axes[slice_idx].legend(loc='upper right')
-        axes[slice_idx].grid(True, alpha=0.3)
-    
-    axes[2].set_xlabel('Time (hours)')
+    return B_hist
+
+# =====================================================
+# BATCH PROCESSING FOR MULTIPLE FILES
+# =====================================================
+def process_multiple_files(file_paths, output_dir='results'):
+    """Process multiple Excel files in batch"""
+    Path(output_dir).mkdir(exist_ok=True)
+    results = []
+
+    print(f"Processing {len(file_paths)} files...")
+
+    for filepath in tqdm(file_paths):
+        try:
+            # Load and clean
+            df = load_excel_optimized(filepath)
+            if df is None:
+                continue
+
+            df = clean_dataframe(df)
+            df = engineer_features(df)
+            df = classify_traffic_vectorized(df)
+
+            # DPAS slicing
+            demands = df[['data', 'rt', 'sig']].values.astype(np.float32)
+            B_hist = dpas_slicing(
+                demands,
+                CONFIG['C'],
+                CONFIG['alpha'],
+                CONFIG['min_bandwidth'],
+                CONFIG['max_bandwidth']
+            )
+
+            # Calculate SLA
+            delay = demands / np.maximum(B_hist, 1e-6)
+            sla_thresholds = np.array(CONFIG['sla_thresholds'])
+            violations = delay > sla_thresholds
+            sla_rate = 100 * (1 - violations.mean())
+
+            # Store results
+            result = {
+                'file': Path(filepath).name,
+                'n_records': len(df),
+                'sla_rate': sla_rate,
+                'avg_embb_bw': B_hist[:, 0].mean(),
+                'avg_urllc_bw': B_hist[:, 1].mean(),
+                'avg_mmtc_bw': B_hist[:, 2].mean(),
+                'traffic_dist': df['Traffic_Class'].value_counts().to_dict()
+            }
+            results.append(result)
+
+            # Save processed data
+            output_file = Path(output_dir) / f"{Path(filepath).stem}_processed.parquet"
+            df.to_parquet(output_file, index=False)
+
+            # Save bandwidth history
+            bw_df = pd.DataFrame(B_hist, columns=['eMBB', 'URLLC', 'mMTC'])
+            bw_file = Path(output_dir) / f"{Path(filepath).stem}_bandwidth.parquet"
+            bw_df.to_parquet(bw_file, index=False)
+
+            # Clean up memory
+            del df, demands, B_hist, delay
+            gc.collect()
+
+        except Exception as e:
+            print(f"Error processing {filepath}: {e}")
+            continue
+
+    return pd.DataFrame(results)
+
+# =====================================================
+# VISUALIZATION FUNCTIONS
+# =====================================================
+def plot_traffic_composition(df, max_points=5000):
+    """Plot traffic composition with downsampling for large datasets"""
+    if len(df) > max_points:
+        step = len(df) // max_points
+        df_plot = df.iloc[::step]
+    else:
+        df_plot = df
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.stackplot(
+        range(len(df_plot)),
+        df_plot['data'],
+        df_plot['rt'],
+        df_plot['sig'],
+        labels=['eMBB (Internet)', 'URLLC (Calls)', 'mMTC (SMS)'],
+        alpha=0.8
+    )
+    ax.legend(loc='upper right')
+    ax.set_xlabel('Time Index')
+    ax.set_ylabel('Traffic Volume')
+    ax.set_title('Traffic Composition Over Time')
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/bandwidth_allocation.png', dpi=150, bbox_inches='tight')
-    print(f"    ✓ Saved: bandwidth_allocation.png")
-    
-    # Plot 2: SLA Violations
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    sla_violations = {}
-    for algo_name, metrics in results.items():
-        delay = metrics['delay_array']
-        violations = np.zeros_like(delay)
-        for i, threshold in enumerate(sla_thresholds):
-            violations[:, i] = (delay[:, i] > threshold).astype(int)
-        sla_violations[algo_name] = np.mean(violations, axis=0)
-    
-    x = np.arange(len(slice_names))
-    width = 0.2
-    
-    for idx, algo_name in enumerate(algorithms.keys()):
-        violation_rate = 100 * (1 - sla_violations[algo_name])
-        ax.bar(x + idx*width, violation_rate, width, label=algo_name)
-    
-    ax.set_ylabel('SLA Satisfaction Rate (%)')
-    ax.set_title('SLA Satisfaction Rate by Slice and Algorithm')
-    ax.set_xticks(x + width * 1.5)
-    ax.set_xticklabels(slice_names)
+    return fig
+
+def plot_bandwidth_allocation(B_hist, max_points=5000):
+    """Plot bandwidth allocation with downsampling"""
+    if len(B_hist) > max_points:
+        step = len(B_hist) // max_points
+        B_plot = B_hist[::step]
+    else:
+        B_plot = B_hist
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(B_plot[:, 0], label='eMBB', linewidth=1.5)
+    ax.plot(B_plot[:, 1], label='URLLC', linewidth=1.5)
+    ax.plot(B_plot[:, 2], label='mMTC', linewidth=1.5)
+    ax.set_ylabel('Bandwidth (Mbps)')
+    ax.set_xlabel('Time Index')
+    ax.set_title('DPAS Bandwidth Allocation')
     ax.legend()
-    ax.grid(True, alpha=0.3, axis='y')
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/sla_satisfaction.png', dpi=150, bbox_inches='tight')
-    print(f"    ✓ Saved: sla_satisfaction.png")
-    
-    # Plot 3: Pressure Evolution (DPAS only)
-    fig, axes = plt.subplots(1, 1, figsize=(12, 6))
-    
-    P = results['DPAS']['P_array']
-    for i, name in enumerate(slice_names):
-        axes.plot(P[:, i], label=f'P_{name}', linewidth=1.5, alpha=0.8)
-    
-    axes.axhline(np.mean(P), color='k', linestyle='--', linewidth=2, label='Mean Pressure', alpha=0.5)
-    axes.set_xlabel('Time (hours)')
-    axes.set_ylabel('Demand Pressure (P_i = D_i / B_i)')
-    axes.set_title('DPAS: Pressure Evolution (Should Converge to Mean)')
-    axes.legend()
-    axes.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/pressure_evolution.png', dpi=150, bbox_inches='tight')
-    print(f"    ✓ Saved: pressure_evolution.png")
-    
-    # ---- Step 8: Save Results for LaTeX ----
-    print("\n[8] Saving results for LaTeX inclusion...")
-    
-    with open(f'{OUTPUT_DIR}/{RESULTS_FILE}', 'w') as f:
-        f.write("EXPERIMENTAL RESULTS - COPY TO PAPER\n")
-        f.write("="*70 + "\n\n")
-        
-        f.write("TABLE: Performance Comparison\n")
-        f.write("-"*70 + "\n")
-        f.write(f"{'Algorithm':<20} {'SLA Sat (%)':<15} {'Avg Delay (ms)':<18} {'Oscillation':<15}\n")
-        f.write("-"*70 + "\n")
-        for algo_name, metrics in results.items():
-            f.write(f"{algo_name:<20} {metrics['sla_sat_rate']:<15.2f} "
-                    f"{metrics['avg_delay']:<18.2f} {metrics['oscillation']:<15.4f}\n")
-        f.write("-"*70 + "\n\n")
-        
-        f.write("KEY FINDINGS:\n")
-        f.write(f"DPAS SLA Satisfaction: {results['DPAS']['sla_sat_rate']:.1f}%\n")
-        f.write(f"Static SLA Satisfaction: {results['Static']['sla_sat_rate']:.1f}%\n")
-        f.write(f"Proportional SLA Satisfaction: {results['Proportional']['sla_sat_rate']:.1f}%\n")
-        f.write(f"\nDPAS Improvement over Static: {results['DPAS']['sla_sat_rate'] - results['Static']['sla_sat_rate']:.1f}%\n")
-        f.write(f"DPAS Improvement over Proportional: {results['DPAS']['sla_sat_rate'] - results['Proportional']['sla_sat_rate']:.1f}%\n")
-    
-    print(f"    ✓ Saved: {RESULTS_FILE}")
-    print(f"    → Copy numerical results from {OUTPUT_DIR}/{RESULTS_FILE} into LaTeX paper")
-    
-    print("\n" + "="*70)
-    print("✓ Simulation Complete!")
-    print("="*70 + "\n")
+    return fig
 
+def plot_summary_stats(results_df):
+    """Plot summary statistics for multiple files"""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # SLA rates
+    axes[0, 0].bar(range(len(results_df)), results_df['sla_rate'])
+    axes[0, 0].set_ylabel('SLA Rate (%)')
+    axes[0, 0].set_title('SLA Satisfaction by File')
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Average bandwidths
+    bw_data = results_df[['avg_embb_bw', 'avg_urllc_bw', 'avg_mmtc_bw']]
+    bw_data.plot(kind='bar', ax=axes[0, 1], width=0.8)
+    axes[0, 1].set_ylabel('Bandwidth (Mbps)')
+    axes[0, 1].set_title('Average Bandwidth Allocation')
+    axes[0, 1].legend(['eMBB', 'URLLC', 'mMTC'])
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Record counts
+    axes[1, 0].bar(range(len(results_df)), results_df['n_records'])
+    axes[1, 0].set_ylabel('Number of Records')
+    axes[1, 0].set_title('Dataset Sizes')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Remove empty subplot
+    fig.delaxes(axes[1, 1])
+
+    plt.tight_layout()
+    return fig
+
+# =====================================================
+# MAIN EXECUTION FOR COLAB
+# =====================================================
+def main():
+    """Main execution function for Colab"""
+    print("=" * 60)
+    print("OPTIMIZED NETWORK SLICING FOR GOOGLE COLAB")
+    print("=" * 60)
+
+    # Upload files in Colab
+    from google.colab import files
+    print("\n📤 Upload your Excel files...")
+    uploaded = files.upload()
+
+    if not uploaded:
+        print("❌ No files uploaded!")
+        return
+
+    file_paths = list(uploaded.keys())
+    print(f"\n✅ Uploaded {len(file_paths)} file(s)")
+
+    # Process files
+    results_df = process_multiple_files(file_paths)
+
+    # Display results
+    print("\n" + "=" * 60)
+    print("PROCESSING SUMMARY")
+    print("=" * 60)
+    print(results_df.to_string(index=False))
+
+    # Save summary
+    results_df.to_csv('processing_summary.csv', index=False)
+    print("\n💾 Summary saved to: processing_summary.csv")
+
+    # Generate summary plots
+    if len(results_df) > 0:
+        fig = plot_summary_stats(results_df)
+        plt.savefig('summary_stats.png', dpi=150, bbox_inches='tight')
+        print("📊 Summary plot saved to: summary_stats.png")
+        plt.show()
+
+    # Process first file for detailed visualization
+    if len(file_paths) > 0:
+        print(f"\n📈 Generating detailed plots for: {file_paths[0]}")
+        df = load_excel_optimized(file_paths[0])
+        df = clean_dataframe(df)
+        df = engineer_features(df)
+        df = classify_traffic_vectorized(df)
+
+        # Traffic composition
+        fig1 = plot_traffic_composition(df)
+        plt.savefig('traffic_composition.png', dpi=150, bbox_inches='tight')
+        plt.show()
+
+        # Bandwidth allocation
+        demands = df[['data', 'rt', 'sig']].values.astype(np.float32)
+        B_hist = dpas_slicing(demands, CONFIG['C'], CONFIG['alpha'])
+        fig2 = plot_bandwidth_allocation(B_hist)
+        plt.savefig('bandwidth_allocation.png', dpi=150, bbox_inches='tight')
+        plt.show()
+
+        print("\n✅ Processing complete!")
+        print(f"📁 Results saved in 'results/' directory")
+
+        # Download results
+        print("\n💾 Downloading results...")
+        files.download('processing_summary.csv')
+
+# =====================================================
+# RUN IN COLAB
+# =====================================================
 if __name__ == "__main__":
     main()
